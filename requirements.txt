@@ -1,0 +1,4 @@
+xyberos
+fastapi
+uvicorn
+websockets

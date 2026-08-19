@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Xyber — Xyberos AI</title>
+    <!-- Tailwind Play CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Slim, theme-aware scrollbar */
+        #chat-messages::-webkit-scrollbar { width: 8px; }
+        #chat-messages::-webkit-scrollbar-track { background: transparent; }
+        #chat-messages::-webkit-scrollbar-thumb { background: #374151; border-radius: 8px; }
+        #chat-messages::-webkit-scrollbar-thumb:hover { background: #4b5563; }
+
+        /* Typing indicator dots */
+        @keyframes blink {
+            0%, 80%, 100% { opacity: 0.25; transform: translateY(0); }
+            40%           { opacity: 1;    transform: translateY(-3px); }
+        }
+        .typing-dot { width: 7px; height: 7px; border-radius: 9999px; background: #9ca3af; animation: blink 1.2s infinite ease-in-out; }
+        .typing-dot:nth-child(2) { animation-delay: 0.2s; }
+        .typing-dot:nth-child(3) { animation-delay: 0.4s; }
+
+        /* Button spinner while waiting for a reply */
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .spinner {
+            width: 16px; height: 16px; border-radius: 9999px; display: inline-block;
+            border: 2px solid rgba(255, 255, 255, 0.35); border-top-color: #fff;
+            animation: spin 0.8s linear infinite;
+        }
+
+        /* Fade a message row in as it appears */
+        @keyframes pop-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+        .pop-in { animation: pop-in 0.18s ease-out; }
+    </style>
+</head>
+<body class="bg-gradient-to-b from-gray-950 via-gray-900 to-gray-950 min-h-screen flex items-center justify-center p-4">
+
+    <div class="w-full max-w-2xl h-[86vh] flex flex-col rounded-2xl bg-gray-900/70 backdrop-blur-md border border-gray-800 shadow-2xl overflow-hidden">
+
+        <!-- Header -->
+        <header class="flex items-center gap-3 px-5 py-4 border-b border-gray-800 bg-gray-900/80">
+            <div class="w-10 h-10 shrink-0 rounded-full bg-gradient-to-br from-teal-400 to-cyan-600 flex items-center justify-center text-xl shadow-lg shadow-teal-500/20">
+                🤖
+            </div>
+            <div class="flex-1 min-w-0">
+                <h1 class="font-bold text-gray-100 leading-tight">Xyber</h1>
+                <p class="text-xs text-gray-500 truncate">Xyberos · Qwen 2.5 · local Ollama</p>
+            </div>
+            <button id="clear-btn" title="New chat" class="w-9 h-9 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-gray-200 transition flex items-center justify-center text-sm">
+                🗑️
+            </button>
+            <span id="status-pill" class="flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-full bg-gray-800 text-gray-400">
+                <span id="status-dot" class="w-2 h-2 rounded-full bg-yellow-400"></span>
+                <span id="status-text">Connecting</span>
+            </span>
+        </header>
+
+        <!-- Offline banner -->
+        <div id="offline-banner" class="hidden bg-red-950/60 border-b border-red-900 text-red-300 text-xs text-center px-4 py-2">
+            Connection lost — retrying…
+        </div>
+
+        <!-- Messages -->
+        <main id="chat-messages" class="flex-1 overflow-y-auto px-5 py-6 space-y-5"></main>
+
+        <!-- Composer -->
+        <footer class="border-t border-gray-800 bg-gray-900/80 p-4">
+            <div class="flex items-end gap-2">
+                <textarea id="message-input" rows="1" placeholder="Ask Xyber anything…"
+                    class="flex-1 resize-none bg-gray-800/80 text-gray-100 rounded-xl px-4 py-3 max-h-40
+                           focus:outline-none focus:ring-2 focus:ring-teal-500 border border-gray-700
+                           placeholder-gray-500 text-[15px] leading-relaxed"></textarea>
+                <button id="send-btn"
+                    class="h-[46px] shrink-0 px-5 rounded-xl bg-gradient-to-r from-teal-500 to-cyan-600
+                           hover:from-teal-400 hover:to-cyan-500 text-white font-semibold transition
+                           shadow-lg shadow-teal-900/30 flex items-center justify-center min-w-[76px]">
+                    Send
+                </button>
+            </div>
+            <p class="mt-2 text-[11px] text-gray-500 text-center select-none">Enter to send · Shift + Enter for a new line</p>
+        </footer>
+    </div>
+
+    <script>
+        const messagesEl = document.getElementById('chat-messages');
+        const inputEl = document.getElementById('message-input');
+        const sendBtn = document.getElementById('send-btn');
+        const statusDot = document.getElementById('status-dot');
+        const statusText = document.getElementById('status-text');
+        const offlineBanner = document.getElementById('offline-banner');
+
+        let socket = null;
+        let waiting = false;
+        let typingRow = null;
+        let reconnectTimer = null;
+
+        // ---------- rendering ----------
+
+        function scrollToBottom() {
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+        }
+
+        function addRow(kind, content) {
+            const row = document.createElement('div');
+            row.className = 'flex pop-in ' + (kind === 'user' ? 'justify-end' : 'justify-start');
+            row.style.opacity = '1';
+
+            if (kind === 'user') {
+                const bubble = document.createElement('div');
+                bubble.className = 'max-w-[80%] px-4 py-2.5 rounded-2xl rounded-tr-sm bg-teal-600 text-white ' +
+                                   'shadow-md shadow-teal-900/30 text-[15px] leading-relaxed whitespace-pre-wrap break-words';
+                bubble.textContent = content;
+                row.appendChild(bubble);
+            } else {
+                const avatar = document.createElement('div');
+                avatar.className = 'w-8 h-8 shrink-0 rounded-full bg-gradient-to-br from-teal-400 to-cyan-600 ' +
+                                   'flex items-center justify-center text-base shadow shadow-teal-900/30';
+                avatar.textContent = '🤖';
+
+                const bubble = document.createElement('div');
+                bubble.className = 'max-w-[80%] px-4 py-2.5 rounded-2xl rounded-tl-sm bg-gray-800 text-gray-100 ' +
+                                   'border border-gray-700/60 shadow text-[15px] leading-relaxed whitespace-pre-wrap break-words';
+                bubble.textContent = content;
+
+                row.appendChild(avatar);
+                row.appendChild(bubble);
+            }
+            messagesEl.appendChild(row);
+            scrollToBottom();
+            return row;
+        }
+
+        function addError(content) {
+            const row = document.createElement('div');
+            row.className = 'flex justify-center pop-in';
+            const bubble = document.createElement('div');
+            bubble.className = 'max-w-[90%] text-xs text-red-300 bg-red-950/50 border border-red-900/60 ' +
+                               'rounded-lg px-3 py-2 text-center whitespace-pre-wrap break-words';
+            bubble.textContent = content;
+            row.appendChild(bubble);
+            messagesEl.appendChild(row);
+            scrollToBottom();
+        }
+
+        function showTyping(show) {
+            if (show && !typingRow) {
+                const row = document.createElement('div');
+                row.className = 'flex justify-start pop-in';
+                const avatar = document.createElement('div');
+                avatar.className = 'w-8 h-8 shrink-0 rounded-full bg-gradient-to-br from-teal-400 to-cyan-600 ' +
+                                   'flex items-center justify-center text-base';
+                avatar.textContent = '🤖';
+                const bubble = document.createElement('div');
+                bubble.className = 'rounded-2xl rounded-tl-sm bg-gray-800 border border-gray-700/60 shadow px-4 py-3 flex items-center gap-1.5';
+                for (let i = 0; i < 3; i++) {
+                    const dot = document.createElement('span');
+                    dot.className = 'typing-dot';
+                    bubble.appendChild(dot);
+                }
+                row.appendChild(avatar);
+                row.appendChild(bubble);
+                messagesEl.appendChild(row);
+                scrollToBottom();
+                typingRow = row;
+            } else if (!show && typingRow) {
+                typingRow.remove();
+                typingRow = null;
+            }
+        }
+
+        function setWaiting(w) {
+            waiting = w;
+            sendBtn.disabled = w;
+            sendBtn.classList.toggle('opacity-50', w);
+            sendBtn.classList.toggle('cursor-not-allowed', w);
+            sendBtn.innerHTML = w ? '<span class="spinner"></span>' : 'Send';
+        }
+
+        // ---------- connection ----------
+
+        function setStatus(state) {
+            const map = {
+                connecting: ['bg-yellow-400', 'Connecting'],
+                online:     ['bg-green-400', 'Online'],
+                offline:    ['bg-red-400',   'Reconnecting…'],
+            };
+            const [color, label] = map[state] || map.connecting;
+            statusDot.className = 'w-2 h-2 rounded-full ' + color;
+            statusText.textContent = label;
+            offlineBanner.classList.toggle('hidden', state !== 'offline');
+        }
+
+        function connect() {
+            clearTimeout(reconnectTimer);
+            setStatus('connecting');
+            const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+            socket = new WebSocket(proto + '://' + location.host + '/ws');
+
+            socket.onopen = () => setStatus('online');
+
+            socket.onmessage = (evt) => handleMessage(evt.data);
+
+            socket.onclose = () => {
+                setStatus('offline');
+                if (typingRow) { typingRow.remove(); typingRow = null; }
+                setWaiting(false);
+                scheduleReconnect();
+            };
+
+            socket.onerror = () => socket.close();
+        }
+
+        function scheduleReconnect() {
+            reconnectTimer = setTimeout(connect, 2000);
+        }
+
+        function handleMessage(raw) {
+            let msg;
+            try { msg = JSON.parse(raw); } catch { return; }
+
+            if (msg.type === 'typing') {
+                showTyping(true);
+            } else if (msg.type === 'reply') {
+                showTyping(false);
+                addRow('ai', msg.content || '');
+                setWaiting(false);
+            } else if (msg.type === 'error') {
+                showTyping(false);
+                addError(msg.content || 'Something went wrong.');
+                setWaiting(false);
+            }
+        }
+
+        // ---------- composer ----------
+
+        function autoResize() {
+            inputEl.style.height = 'auto';
+            inputEl.style.height = Math.min(inputEl.scrollHeight, 160) + 'px';
+        }
+
+        function sendMessage() {
+            if (waiting) return;
+            const text = inputEl.value.trim();
+            if (!text) return;
+            if (!socket || socket.readyState !== WebSocket.OPEN) {
+                addError('Not connected to the server yet — please wait a moment.');
+                return;
+            }
+            addRow('user', text);
+            inputEl.value = '';
+            autoResize();
+            setWaiting(true);
+            socket.send(JSON.stringify({ message: text }));
+        }
+
+        // ---------- events ----------
+
+        sendBtn.addEventListener('click', sendMessage);
+
+        inputEl.addEventListener('input', autoResize);
+        inputEl.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendMessage();
+            }
+        });
+
+        document.getElementById('clear-btn').addEventListener('click', () => {
+            messagesEl.innerHTML = '';
+            showTyping(false);
+            setWaiting(false);
+            addRow('ai', 'Hello! I am Xyber, your witty AI assistant. Ask me anything!');
+        });
+
+        window.addEventListener('beforeunload', () => socket && socket.close());
+
+        // ---------- init ----------
+
+        addRow('ai', 'Hello! I am Xyber, your witty AI assistant. Ask me anything!');
+        connect();
+    </script>
+</body>
+</html>
